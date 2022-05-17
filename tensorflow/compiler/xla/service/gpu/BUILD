@@ -64,6 +64,7 @@ check_deps(
         "//conditions:default": [
             ":xlir_kernels",
             ":xlir_opdefs",
+            ":jitrt_custom_calls",
             "@tf_runtime//:basic_kernels_alwayslink",
             "@tf_runtime//:basic_kernels_opdefs",
             "@tf_runtime//:befexecutor",
@@ -639,6 +640,29 @@ cc_library(
 )
 
 cc_library(
+    name = "jitrt_custom_calls",
+    srcs = ["jitrt_custom_calls.cc"],
+    hdrs = ["jitrt_custom_calls.h"],
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//tensorflow/compiler/xla:shape_util",
+        "//tensorflow/compiler/xla/service:executable",
+        "//tensorflow/compiler/xla/service/gpu:gemm_thunk",
+        "//tensorflow/compiler/xla/service/gpu:matmul_utils",
+        "//tensorflow/compiler/xla/service/gpu:stream_executor_util",
+        "//tensorflow/stream_executor",
+        "@llvm-project//llvm:OrcJIT",
+        "@llvm-project//mlir:Support",
+        "@tf_runtime//:dtype",
+        "@tf_runtime//:support",
+        "@tf_runtime//backends/jitrt",
+        "@tf_runtime//backends/jitrt:custom_call",
+        "@tf_runtime//backends/jitrt:types",
+    ],
+)
+
+cc_library(
     name = "gpu_executable",
     srcs = [
         "bef_thunk.cc",
@@ -776,6 +800,7 @@ cc_library(
         ":is_xlir_enabled": [
             ":xlir_kernels",
             ":xlir_opdefs",
+            ":jitrt_custom_calls",
             "@llvm-project//llvm:Support",
             "@llvm-project//mlir:GPUTransforms",
             "@llvm-project//mlir:Pass",
@@ -788,6 +813,8 @@ cc_library(
             "@tf_runtime//:basic_kernels_alwayslink",
             "@tf_runtime//:basic_kernels_opdefs",
             "@tf_runtime//:bef",
+            "@tf_runtime//backends/jitrt",
+            "@tf_runtime//backends/jitrt:jitrt_compiler",
             "@tf_runtime//:befexecutor",
             "@tf_runtime//:beftomlir",
             "@tf_runtime//:core_runtime",
@@ -1575,6 +1602,7 @@ cc_library(
         ":gpu_reduce_scatter_creator",
         ":gpu_sanitize_constant_names",
         ":gpu_scatter_expander",
+        ":matmul_utils",
         "@llvm-project//mlir:FuncDialect",
         "//tensorflow/compiler/xla/service/spmd:stateful_rng_spmd_partitioner",
         ":gpu_hlo_cost_analysis",
@@ -1962,6 +1990,7 @@ cc_library(
     deps = [
         ":backend_configs_cc",
         ":ir_emission_utils",
+        ":matmul_utils",
         ":stream_executor_util",
         "//tensorflow/compiler/xla:shape_util",
         "//tensorflow/compiler/xla:status_macros",
@@ -1972,6 +2001,8 @@ cc_library(
         "//tensorflow/compiler/xla/service:layout_assignment",
         "//tensorflow/core:lib",
         "//tensorflow/core/platform:stream_executor_no_cuda",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -1992,6 +2023,7 @@ tf_cc_test(
         "//tensorflow/compiler/xla/service:hlo_parser",
         "//tensorflow/compiler/xla/tests:hlo_test_base",
         "//tensorflow/compiler/xla/tests:xla_internal_test_main",  # build_cleaner: keep
+        "//tensorflow/core/platform:status_matchers",
         "//tensorflow/stream_executor/lib",
         "@com_google_absl//absl/strings",
     ],
