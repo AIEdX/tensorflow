@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/core/distributed_runtime/coordination/coordination_service.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -353,6 +354,51 @@ TEST(CoordinationServiceTest, TestCoordinatedJobs) {
   EXPECT_TRUE(errors::IsInvalidArgument(status)) << status;
 }
 
+TEST(CoordinationServiceTest, RegisterTask_AlreadyConnected_Fails) {
+  ServerDef server_def = GetMultiClientServerDef("worker", 1);
+  JobDef* job_def = server_def.mutable_cluster()->add_job();
+  job_def->set_name("worker");
+  job_def->mutable_tasks()->insert({0, "dummy address"});
+  CoordinatedTask task_0;
+  task_0.set_job_name("worker");
+  task_0.set_task_id(0);
+  std::unique_ptr<CoordinationServiceInterface> coord_service =
+      CoordinationServiceInterface::EnableCoordinationService(
+          kCoordinationServiceType, Env::Default(), server_def,
+          /*cache=*/nullptr);
+  // Task connects to coordination service.
+  TF_ASSERT_OK(coord_service->RegisterTask(task_0, /*incarnation=*/0));
+
+  // Registration should fail since task already registered previously.
+  const Status status = coord_service->RegisterTask(task_0, /*incarnation=*/0);
+
+  EXPECT_TRUE(errors::IsAborted(status)) << status;
+}
+
+TEST(CoordinationServiceTest, RegisterTask_AlreadyInError_Fails) {
+  ServerDef server_def = GetMultiClientServerDef("worker", 1);
+  JobDef* job_def = server_def.mutable_cluster()->add_job();
+  job_def->set_name("worker");
+  job_def->mutable_tasks()->insert({0, "dummy address"});
+  CoordinatedTask task_0;
+  task_0.set_job_name("worker");
+  task_0.set_task_id(0);
+  std::unique_ptr<CoordinationServiceInterface> coord_service =
+      CoordinationServiceInterface::EnableCoordinationService(
+          kCoordinationServiceType, Env::Default(), server_def,
+          /*cache=*/nullptr);
+  // Task connects to coordination service.
+  TF_ASSERT_OK(coord_service->RegisterTask(task_0, /*incarnation=*/0));
+  // Arbitrarily set task to be in error.
+  TF_ASSERT_OK(
+      coord_service->ReportTaskError(task_0, errors::Internal("test_error")));
+
+  // Registration should fail since task already registered previously.
+  const Status status = coord_service->RegisterTask(task_0, /*incarnation=*/0);
+
+  EXPECT_TRUE(errors::IsAborted(status)) << status;
+}
+
 TEST_F(CoordinateTwoTasksTest, TestTaskHeartbeatTimeout) {
   EnableCoordinationService();
   TF_ASSERT_OK(coord_service_->RegisterTask(task_0_, incarnation_0_));
@@ -439,11 +485,15 @@ TEST_F(CoordinateTwoTasksTest, TestSetGetValues) {
   // Delete key-values recursively
   TF_ASSERT_OK(coord_service_->DeleteKeyValue("/path"));
   // Get key that is not available
-  absl::Notification n2;
+  auto n2 = std::make_shared<absl::Notification>();
   coord_service_->GetKeyValueAsync(
       "/path/to/key1",
-      [&](const StatusOr<std::string>& status_or_value) { n2.Notify(); });
-  EXPECT_FALSE(n2.HasBeenNotified());
+      // Note: this callback will remain pending until it is cleaned up during
+      // service shutdown. Hence, we use a shared pointer for notification so
+      // that the it will not be deallocated before the pending callback is
+      // cleaned up.
+      [n2](const StatusOr<std::string>& status_or_value) { n2->Notify(); });
+  EXPECT_FALSE(n2->HasBeenNotified());
 }
 
 TEST_F(CoordinateTwoTasksTest, GetKeyValueDir_SingleValueInDirectory) {
@@ -645,6 +695,62 @@ TEST(CoordinationServiceTest, ListClusterDevices_XlaDevice) {
       local_1;
   *expected_cluster_devices.mutable_xla()->mutable_devices()->add_nodes() =
       local_2;
+  EXPECT_THAT(cluster_devices, IgnoringRepeatedFieldOrdering(
+                                   EqualsProto(expected_cluster_devices)));
+}
+
+// Task devices should not be added twice if same task calls WaitForAllDevices()
+// twice.
+TEST(CoordinationServiceTest, ListClusterDevices_DevicesAreNotAddedTwice) {
+  const ServerDef& server_def = GetMultiClientServerDef("worker", 2);
+  CoordinatedTask task_0;
+  task_0.set_job_name("worker");
+  task_0.set_task_id(0);
+  CoordinatedTask task_1;
+  task_1.set_job_name("worker");
+  task_1.set_task_id(1);
+  Status status = Status::OK();
+  auto client_cache = std::make_unique<TestCoordinationClientCache>();
+  std::unique_ptr<CoordinationServiceInterface> coord_service =
+      CoordinationServiceInterface::EnableCoordinationService(
+          kCoordinationServiceType, Env::Default(), server_def,
+          std::move(client_cache));
+  absl::Notification n;
+  // Map fake devices to each task.
+  CoordinationServiceDeviceInfo local_devices_0;
+  CoordinationServiceDeviceInfo local_devices_1;
+  *local_devices_0.mutable_tf()->mutable_devices()->Add() =
+      CreateTestTfDevice("task0_device0");
+  *local_devices_0.mutable_tf()->mutable_devices()->Add() =
+      CreateTestTfDevice("task0_device1");
+  *local_devices_1.mutable_tf()->mutable_devices()->Add() =
+      CreateTestTfDevice("task1_device0");
+  // Task0 sends device info.
+  CoordinationServiceDeviceInfo cluster_devices;
+  coord_service->WaitForAllTasks(task_0, local_devices_0,
+                                 [](Status s) { TF_ASSERT_OK(s); });
+
+  // Task0 sends device info sgain.
+  coord_service->WaitForAllTasks(task_0, local_devices_0,
+                                 [](Status s) { TF_ASSERT_OK(s); });
+  coord_service->WaitForAllTasks(
+      task_1, local_devices_1,
+      [coord_service = coord_service.get(), &cluster_devices, &n](Status s) {
+        TF_ASSERT_OK(s);
+        // Gather the cluster device info.
+        cluster_devices = coord_service->ListClusterDevices();
+        n.Notify();
+      });
+  n.WaitForNotification();
+
+  // No duplicates found.
+  CoordinationServiceDeviceInfo expected_cluster_devices;
+  auto expected_devices =
+      expected_cluster_devices.mutable_tf()->mutable_devices();
+  expected_devices->Add(local_devices_0.mutable_tf()->devices().begin(),
+                        local_devices_0.mutable_tf()->devices().end());
+  expected_devices->Add(local_devices_1.mutable_tf()->devices().begin(),
+                        local_devices_1.mutable_tf()->devices().end());
   EXPECT_THAT(cluster_devices, IgnoringRepeatedFieldOrdering(
                                    EqualsProto(expected_cluster_devices)));
 }
