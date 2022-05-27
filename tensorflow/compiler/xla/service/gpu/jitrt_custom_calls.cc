@@ -15,12 +15,17 @@
 #include "tensorflow/compiler/xla/service/gpu/jitrt_custom_calls.h"
 
 #include <cstdint>
+#include <iterator>
+#include <memory>
 #include <utility>
 
 #include "llvm/ExecutionEngine/Orc/Mangling.h"
 #include "mlir/Support/LogicalResult.h"  // from @llvm-project
-#include "tensorflow/compiler/xla/service/gpu/gemm_thunk.h"
+#include "tensorflow/compiler/xla/service/gpu/cholesky_thunk.h"
+#include "tensorflow/compiler/xla/service/gpu/gpu_asm_opts_util.h"
+#include "tensorflow/compiler/xla/service/gpu/infeed_manager.h"
 #include "tensorflow/compiler/xla/service/gpu/matmul_utils.h"
+#include "tensorflow/compiler/xla/service/gpu/outfeed_manager.h"
 #include "tensorflow/compiler/xla/service/gpu/stream_executor_util.h"
 #include "tensorflow/compiler/xla/service/service_executable_run_options.h"
 #include "tensorflow/compiler/xla/shape_util.h"
@@ -92,7 +97,8 @@ se::KernelBase* JitRtKernelsCache::Set(se::StreamExecutor* executor,
   return emplaced.first->second.get();
 }
 
-static se::DeviceMemoryBase GetDeviceAddress(jitrt::MemrefView& memref) {
+template <typename MemrefArg>
+static se::DeviceMemoryBase GetDeviceAddress(MemrefArg& memref) {
   uint64_t size = tfrt::GetHostSize(memref.dtype);
   for (auto dim : memref.sizes) size *= dim;
   return se::DeviceMemoryBase(memref.data, size);
@@ -167,14 +173,28 @@ static PrimitiveType ToPrimitiveType(tfrt::DType dtype) {
   }
 }
 
-static Shape ToShape(const jitrt::MemrefView& memref) {
+static Shape ToShape(const jitrt::StridedMemrefView& memref) {
   PrimitiveType type = ToPrimitiveType(memref.dtype);
-  return ShapeUtil::MakeShape(type, memref.sizes);
+
+  // Recover `minor_to_major` dimensions permutation from strides.
+  auto indexed_strides_range =
+      llvm::map_range(llvm::enumerate(memref.strides), [](auto pair) {
+        return std::pair<int64_t, size_t>{pair.value(), pair.index()};
+      });
+
+  auto indexed_strides = llvm::to_vector(indexed_strides_range);
+  llvm::stable_sort(indexed_strides);
+
+  llvm::SmallVector<int64_t> minor_to_major;
+  minor_to_major.reserve(indexed_strides.size());
+  for (auto& pair : indexed_strides) minor_to_major.push_back(pair.second);
+
+  return ShapeUtil::MakeShapeWithLayout(type, memref.sizes, minor_to_major);
 }
 
 static StatusOr<GemmConfig> GetGemmConfig(
-    const DebugOptions* debug_options, const jitrt::MemrefView& lhs,
-    const jitrt::MemrefView& rhs, const jitrt::MemrefView& out,
+    const DebugOptions* debug_options, const jitrt::StridedMemrefView& lhs,
+    const jitrt::StridedMemrefView& rhs, const jitrt::StridedMemrefView& out,
     int64_t algorithm, double alpha_real, double alpha_imag,
     ArrayRef<int64_t> lhs_batch, ArrayRef<int64_t> lhs_contract,
     ArrayRef<int64_t> rhs_batch, ArrayRef<int64_t> rhs_contract,
@@ -232,9 +252,23 @@ LogicalResult LaunchFunc::operator()(
 
   // Add MemRef arguments as buffer arguments.
   for (unsigned i = 0; i < args.size(); ++i) {
+    // Simple row major memref passed as shapeless buffer.
     auto memref = args.get<jitrt::FlatMemrefView>(i);
-    if (failed(memref)) return failure();
-    buffer_args.emplace_back(GetDeviceAddress(*memref));
+    if (succeeded(memref)) {
+      buffer_args.emplace_back(GetDeviceAddress(*memref));
+      continue;
+    }
+
+    // Memref layout must be encoded in the compiled device kernel, so we don't
+    // have to pass strides or minor to major dimensions order to the kernel.
+    auto strided = args.get<jitrt::StridedMemrefView>(i);
+    if (succeeded(strided)) {
+      buffer_args.emplace_back(GetDeviceAddress(*strided));
+      continue;
+    }
+
+    // Unsupported argument type.
+    return failure();
   }
 
   // Execute device kernel on a main stream.
@@ -269,15 +303,14 @@ static bool LaunchFunc(runtime::KernelContext* ctx, void** args, void** attrs) {
 namespace {
 struct Gemm {
   LLVM_ATTRIBUTE_ALWAYS_INLINE
-  LogicalResult operator()(const ServiceExecutableRunOptions* run_options,
-                           const DebugOptions* debug_options,
-                           JitRtGemmConfigCache* configs, jitrt::MemrefView lhs,
-                           jitrt::MemrefView rhs, jitrt::MemrefView out,
-                           int64_t algorithm, double alpha_real,
-                           double alpha_imag, ArrayRef<int64_t> lhs_batch,
-                           ArrayRef<int64_t> lhs_contract,
-                           ArrayRef<int64_t> rhs_batch,
-                           ArrayRef<int64_t> rhs_contract, int64_t uid) const;
+  LogicalResult operator()(
+      const ServiceExecutableRunOptions* run_options,
+      const DebugOptions* debug_options, JitRtGemmConfigCache* configs,
+      jitrt::StridedMemrefView lhs, jitrt::StridedMemrefView rhs,
+      jitrt::StridedMemrefView out, int64_t algorithm, double alpha_real,
+      double alpha_imag, ArrayRef<int64_t> lhs_batch,
+      ArrayRef<int64_t> lhs_contract, ArrayRef<int64_t> rhs_batch,
+      ArrayRef<int64_t> rhs_contract, int64_t uid) const;
 
   static Gemm Handler() { return Gemm(); }
 };
@@ -286,17 +319,14 @@ struct Gemm {
 LogicalResult Gemm::operator()(
     const ServiceExecutableRunOptions* run_options,
     const DebugOptions* debug_options, JitRtGemmConfigCache* configs,
-    jitrt::MemrefView lhs, jitrt::MemrefView rhs, jitrt::MemrefView out,
-    int64_t algorithm, double alpha_real, double alpha_imag,
-    ArrayRef<int64_t> lhs_batch, ArrayRef<int64_t> lhs_contract,
-    ArrayRef<int64_t> rhs_batch, ArrayRef<int64_t> rhs_contract,
-    int64_t uid) const {
+    jitrt::StridedMemrefView lhs, jitrt::StridedMemrefView rhs,
+    jitrt::StridedMemrefView out, int64_t algorithm, double alpha_real,
+    double alpha_imag, ArrayRef<int64_t> lhs_batch,
+    ArrayRef<int64_t> lhs_contract, ArrayRef<int64_t> rhs_batch,
+    ArrayRef<int64_t> rhs_contract, int64_t uid) const {
   se::DeviceMemoryBase lhs_data = GetDeviceAddress(lhs);
   se::DeviceMemoryBase rhs_data = GetDeviceAddress(rhs);
   se::DeviceMemoryBase output_data = GetDeviceAddress(out);
-
-  se::OwningScratchAllocator<> scratch_allocator(run_options->device_ordinal(),
-                                                 run_options->allocator());
 
   VLOG(3) << "Running GEMM";
   se::Stream* stream = run_options->stream();
@@ -311,8 +341,16 @@ LogicalResult Gemm::operator()(
     config = configs->Set(uid, std::move(*cfg));
   }
 
-  auto executed = RunGemm(*config, lhs_data, rhs_data, output_data, stream,
-                          &scratch_allocator, nullptr);
+  Status executed;
+  if (config->use_cublaslt && stream->parent()->SupportsBlasPlans()) {
+    se::OwningScratchAllocator<> scratch_allocator(
+        run_options->device_ordinal(), run_options->allocator());
+    executed = RunBlasLtMatmul(*config, lhs_data, rhs_data, output_data, stream,
+                               scratch_allocator);
+  } else {
+    executed = RunGemm(*config, lhs_data, rhs_data, output_data, stream);
+  }
+
   if (!executed.ok()) return failure();
 
   return success();
@@ -324,9 +362,9 @@ static bool Gemm(runtime::KernelContext* ctx, void** args, void** attrs) {
           .UserData<const ServiceExecutableRunOptions*>()
           .UserData<const DebugOptions*>()
           .UserData<JitRtGemmConfigCache*>()
-          .Arg<jitrt::MemrefView>()  // lhs
-          .Arg<jitrt::MemrefView>()  // rhs
-          .Arg<jitrt::MemrefView>()  // out
+          .Arg<jitrt::StridedMemrefView>()  // lhs
+          .Arg<jitrt::StridedMemrefView>()  // rhs
+          .Arg<jitrt::StridedMemrefView>()  // out
           .Attr<int64_t>("algorithm")
           .Attr<double>("alpha_real")
           .Attr<double>("alpha_imag")
@@ -346,16 +384,15 @@ static bool Gemm(runtime::KernelContext* ctx, void** args, void** attrs) {
 namespace {
 struct GemmBias {
   LLVM_ATTRIBUTE_ALWAYS_INLINE
-  LogicalResult operator()(const ServiceExecutableRunOptions* run_options,
-                           const DebugOptions* debug_options,
-                           JitRtGemmConfigCache* configs, jitrt::MemrefView lhs,
-                           jitrt::MemrefView rhs, jitrt::MemrefView bias,
-                           jitrt::MemrefView out, int64_t algorithm,
-                           double alpha_real, double alpha_imag, double beta,
-                           ArrayRef<int64_t> lhs_batch,
-                           ArrayRef<int64_t> lhs_contract,
-                           ArrayRef<int64_t> rhs_batch,
-                           ArrayRef<int64_t> rhs_contract, int64_t uid) const;
+  LogicalResult operator()(
+      const ServiceExecutableRunOptions* run_options,
+      const DebugOptions* debug_options, JitRtGemmConfigCache* configs,
+      jitrt::StridedMemrefView lhs, jitrt::StridedMemrefView rhs,
+      jitrt::StridedMemrefView bias, jitrt::StridedMemrefView out,
+      int64_t algorithm, double alpha_real, double alpha_imag, double beta,
+      ArrayRef<int64_t> lhs_batch, ArrayRef<int64_t> lhs_contract,
+      ArrayRef<int64_t> rhs_batch, ArrayRef<int64_t> rhs_contract,
+      int64_t uid) const;
   static GemmBias Handler() { return GemmBias(); }
 };
 }  // namespace
@@ -363,18 +400,16 @@ struct GemmBias {
 LogicalResult GemmBias::operator()(
     const ServiceExecutableRunOptions* run_options,
     const DebugOptions* debug_options, JitRtGemmConfigCache* configs,
-    jitrt::MemrefView lhs, jitrt::MemrefView rhs, jitrt::MemrefView bias,
-    jitrt::MemrefView out, int64_t algorithm, double alpha_real,
-    double alpha_imag, double beta, ArrayRef<int64_t> lhs_batch,
-    ArrayRef<int64_t> lhs_contract, ArrayRef<int64_t> rhs_batch,
-    ArrayRef<int64_t> rhs_contract, int64_t uid) const {
+    jitrt::StridedMemrefView lhs, jitrt::StridedMemrefView rhs,
+    jitrt::StridedMemrefView bias, jitrt::StridedMemrefView out,
+    int64_t algorithm, double alpha_real, double alpha_imag, double beta,
+    ArrayRef<int64_t> lhs_batch, ArrayRef<int64_t> lhs_contract,
+    ArrayRef<int64_t> rhs_batch, ArrayRef<int64_t> rhs_contract,
+    int64_t uid) const {
   se::DeviceMemoryBase lhs_data = GetDeviceAddress(lhs);
   se::DeviceMemoryBase rhs_data = GetDeviceAddress(rhs);
   se::DeviceMemoryBase bias_data = GetDeviceAddress(bias);
   se::DeviceMemoryBase output_data = GetDeviceAddress(out);
-
-  se::OwningScratchAllocator<> scratch_allocator(run_options->device_ordinal(),
-                                                 run_options->allocator());
 
   VLOG(3) << "Running GEMM + Bias [beta=" << beta << "]";
   se::Stream* stream = run_options->stream();
@@ -393,8 +428,16 @@ LogicalResult GemmBias::operator()(
   if (out.data != bias.data)
     stream->ThenMemcpy(&output_data, bias_data, bias_data.size());
 
-  auto executed = RunGemm(*config, lhs_data, rhs_data, output_data, stream,
-                          &scratch_allocator, nullptr);
+  Status executed;
+  if (config->use_cublaslt && stream->parent()->SupportsBlasPlans()) {
+    se::OwningScratchAllocator<> scratch_allocator(
+        run_options->device_ordinal(), run_options->allocator());
+    executed = RunBlasLtMatmul(*config, lhs_data, rhs_data, output_data, stream,
+                               scratch_allocator);
+  } else {
+    executed = RunGemm(*config, lhs_data, rhs_data, output_data, stream);
+  }
+
   if (!executed.ok()) return failure();
 
   return success();
@@ -406,10 +449,10 @@ static bool GemmBias(runtime::KernelContext* ctx, void** args, void** attrs) {
           .UserData<const ServiceExecutableRunOptions*>()
           .UserData<const DebugOptions*>()
           .UserData<JitRtGemmConfigCache*>()
-          .Arg<jitrt::MemrefView>()  // lhs
-          .Arg<jitrt::MemrefView>()  // rhs
-          .Arg<jitrt::MemrefView>()  // bias
-          .Arg<jitrt::MemrefView>()  // out
+          .Arg<jitrt::StridedMemrefView>()  // lhs
+          .Arg<jitrt::StridedMemrefView>()  // rhs
+          .Arg<jitrt::StridedMemrefView>()  // bias
+          .Arg<jitrt::StridedMemrefView>()  // out
           .Attr<int64_t>("algorithm")
           .Attr<double>("alpha_real")
           .Attr<double>("alpha_imag")
@@ -421,6 +464,141 @@ static bool GemmBias(runtime::KernelContext* ctx, void** args, void** attrs) {
           .Attr<int64_t>("uid")
           .To<RuntimeChecks()>(GemmBias::Handler())
           .release();
+
+  return succeeded(handler->call(args, attrs, Executable::GetUserData(ctx)));
+}
+
+// -------------------------------------------------------------------------- //
+
+namespace {
+struct Infeed {
+  LogicalResult operator()(const ServiceExecutableRunOptions* run_options,
+                           CustomCall::RemainingArgs args,
+                           StringRef config) const;
+  static Infeed Handler() { return Infeed(); }
+};
+}  // namespace
+
+LogicalResult Infeed::operator()(const ServiceExecutableRunOptions* run_options,
+                                 CustomCall::RemainingArgs args,
+                                 StringRef config) const {
+  VLOG(3) << "Infeeding to GPU";
+
+  se::Stream* stream = run_options->stream();
+  ShapeTree<se::ScopedDeviceMemory<uint8_t>> source_buffers =
+      GetOrCreateInfeedManager(stream->parent())->BlockingGetNextDestination();
+
+  // Check that we have correct number of arguments.
+  if (args.size() != source_buffers.leaf_count()) return failure();
+
+  // TODO(ezhulenev): Report human-readable error messages through errors.
+  size_t index = 0;
+  for (auto& source : source_buffers.leaves()) {
+    // Get the destination buffer.
+    auto dest = args.get<jitrt::StridedMemrefView>(index);
+    if (failed(dest)) return failure();
+
+    // Get the source buffer shape.
+    const Shape& source_shape =
+        ShapeUtil::GetSubshape(source_buffers.shape(), source.first);
+
+    // Check that destination shape matches the source shape.
+    // TODO(ezhulenev): Report human-readable error similar to infeed_thunk.
+    Shape dest_shape = ToShape(*dest);
+    if (!ShapeUtil::Equal(dest_shape, source_shape)) return failure();
+
+    se::DeviceMemoryBase dest_address = GetDeviceAddress(*dest);
+    se::ScopedDeviceMemory<uint8_t>& buffer = source.second;
+    stream->ThenMemcpy(&dest_address, *buffer.ptr(), buffer.ptr()->size());
+
+    ++index;
+  }
+
+  // TODO(ezhulenev): Make this function async?
+  Status block_status = stream->BlockHostUntilDone();
+  if (!block_status.ok()) return failure();
+
+  VLOG(3) << "Infeeding to GPU complete";
+
+  return success();
+}
+
+static bool Infeed(runtime::KernelContext* ctx, void** args, void** attrs) {
+  static auto* handler = CustomCall::Bind("xla.gpu.infeed")
+                             .UserData<const ServiceExecutableRunOptions*>()
+                             .Arg<CustomCall::RemainingArgs>()  // args
+                             .Attr<StringRef>("config")
+                             .To<RuntimeChecks()>(Infeed::Handler())
+                             .release();
+
+  return succeeded(handler->call(args, attrs, Executable::GetUserData(ctx)));
+}
+
+// -------------------------------------------------------------------------- //
+
+namespace {
+struct Outfeed {
+  LogicalResult operator()(const ServiceExecutableRunOptions* run_options,
+                           CustomCall::RemainingArgs args,
+                           StringRef config) const;
+  static Outfeed Handler() { return Outfeed(); }
+};
+}  // namespace
+
+LogicalResult Outfeed::operator()(
+    const ServiceExecutableRunOptions* run_options,
+    CustomCall::RemainingArgs args, StringRef config) const {
+  VLOG(3) << "Outfeeding from GPU";
+
+  se::Stream* stream = run_options->stream();
+  OutfeedManager* outfeed_manager = GetOrCreateOutfeedManager(stream->parent());
+  ShapeTree<std::unique_ptr<OutfeedBuffer>>* dest_buffers =
+      outfeed_manager->BlockingGetNextDestination();
+
+  // Check that we have correct number of arguments.
+  if (args.size() != dest_buffers->leaf_count()) return failure();
+
+  size_t index = 0;
+  for (auto& dest : dest_buffers->leaves()) {
+    // Get the source buffer.
+    auto source = args.get<jitrt::StridedMemrefView>(index);
+    if (failed(source)) return failure();
+
+    // Get the source buffer shape.
+    const Shape& dest_shape =
+        ShapeUtil::GetSubshape(dest_buffers->shape(), dest.first);
+
+    // Check that destination shape matches the source shape.
+    // TODO(ezhulenev): Report human-readable error similar to outfeed_thunk.
+    Shape source_shape = ToShape(*source);
+    if (!ShapeUtil::Equal(dest_shape, source_shape)) return failure();
+
+    se::DeviceMemoryBase source_address = GetDeviceAddress(*source);
+    std::unique_ptr<OutfeedBuffer>& buffer = dest.second;
+
+    // Schedule the memory transfer.
+    auto* dest_address = buffer->destination()->untyped_data();
+    stream->ThenMemcpy(dest_address, source_address, buffer->length())
+        .ThenDoHostCallback([&buffer]() { buffer->Done(); });
+
+    ++index;
+  }
+
+  Status block_status = stream->BlockHostUntilDone();
+  if (!block_status.ok()) return failure();
+
+  VLOG(3) << "Outfeeding from GPU complete";
+
+  return success();
+}
+
+static bool Outfeed(runtime::KernelContext* ctx, void** args, void** attrs) {
+  static auto* handler = CustomCall::Bind("xla.gpu.outfeed")
+                             .UserData<const ServiceExecutableRunOptions*>()
+                             .Arg<CustomCall::RemainingArgs>()  // args
+                             .Attr<StringRef>("config")
+                             .To<RuntimeChecks()>(Outfeed::Handler())
+                             .release();
 
   return succeeded(handler->call(args, attrs, Executable::GetUserData(ctx)));
 }
@@ -489,6 +667,64 @@ static bool MemcpyFn(runtime::KernelContext* ctx, void** args, void** attrs) {
 
 // -------------------------------------------------------------------------- //
 
+namespace {
+struct Cholesky {
+  LLVM_ATTRIBUTE_ALWAYS_INLINE
+  LogicalResult operator()(const ServiceExecutableRunOptions* run_options,
+                           const DebugOptions* debug_options,
+                           jitrt::MemrefView operand, jitrt::MemrefView a,
+                           jitrt::MemrefView workspace, jitrt::MemrefView info,
+                           int64_t batch_size, int64_t n, int64_t uplo) const;
+  static Cholesky Handler() { return Cholesky(); }
+};
+}  // namespace
+
+LogicalResult Cholesky::operator()(
+    const ServiceExecutableRunOptions* run_options,
+    const DebugOptions* debug_options, jitrt::MemrefView operand,
+    jitrt::MemrefView a, jitrt::MemrefView workspace, jitrt::MemrefView info,
+    int64_t batch_size, int64_t n, int64_t uplo) const {
+  se::DeviceMemoryBase operand_buffer = GetDeviceAddress(operand);
+  se::DeviceMemoryBase a_buffer = GetDeviceAddress(a);
+  se::DeviceMemoryBase workspace_buffer = GetDeviceAddress(workspace);
+  se::DeviceMemoryBase info_buffer = GetDeviceAddress(info);
+
+  VLOG(3) << "Running Cholesky";
+  se::Stream* stream = run_options->stream();
+
+  // Copy operand to the a buffer if they are different.
+  if (a.data != operand.data)
+    stream->ThenMemcpy(&a_buffer, operand_buffer, operand_buffer.size());
+
+  CholeskyParams params{
+      n,        batch_size,       static_cast<se::blas::UpperLower>(uplo),
+      a_buffer, workspace_buffer, info_buffer};
+  auto executed = RunCholesky(xla::gpu::PtxOptsFromDebugOptions(*debug_options),
+                              ToPrimitiveType(operand.dtype), &params, stream);
+  if (!executed.ok()) return failure();
+
+  return success();
+}
+
+static bool Cholesky(runtime::KernelContext* ctx, void** args, void** attrs) {
+  static auto* handler = CustomCall::Bind("xla.gpu.cholesky")
+                             .UserData<const ServiceExecutableRunOptions*>()
+                             .UserData<const DebugOptions*>()
+                             .Arg<jitrt::MemrefView>()  // operand
+                             .Arg<jitrt::MemrefView>()  // a
+                             .Arg<jitrt::MemrefView>()  // workspace
+                             .Arg<jitrt::MemrefView>()  // info
+                             .Attr<int64_t>("batch_size")
+                             .Attr<int64_t>("n")
+                             .Attr<int64_t>("uplo")  // se::blas::UpperLower
+                             .To<RuntimeChecks()>(Cholesky::Handler())
+                             .release();
+
+  return succeeded(handler->call(args, attrs, Executable::GetUserData(ctx)));
+}
+
+// -------------------------------------------------------------------------- //
+
 SymbolMap JitRtCustomCallsSymbolMap(MangleAndInterner mangle) {
   SymbolMap symbol_map;
 
@@ -497,12 +733,15 @@ SymbolMap JitRtCustomCallsSymbolMap(MangleAndInterner mangle) {
         llvm::pointerToJITTargetAddress(symbol_ptr), llvm::JITSymbolFlags());
   };
 
+  bind("xla.gpu.cholesky", &xla::gpu::Cholesky);
   bind("xla.gpu.func.launch", &xla::gpu::LaunchFunc);
   bind("xla.gpu.gemm", &xla::gpu::Gemm);
   bind("xla.gpu.gemm.bias", &xla::gpu::GemmBias);
   bind("xla.gpu.memcpy.d2d", &MemcpyFn<MemcpyDirection::kDeviceToDevice>);
   bind("xla.gpu.memcpy.h2d", &MemcpyFn<MemcpyDirection::kHostToDevice>);
   bind("xla.gpu.memcpy.d2h", &MemcpyFn<MemcpyDirection::kDeviceToHost>);
+  bind("xla.gpu.infeed", &xla::gpu::Infeed);
+  bind("xla.gpu.outfeed", &xla::gpu::Outfeed);
 
   return symbol_map;
 }
